@@ -132,10 +132,14 @@ CPP_SRCS := $(wildcard $(PROJECT_DIR)/*.cpp)
 CPP_OBJS := $(addprefix $(PROJECT_DIR)/build/,$(notdir $(CPP_SRCS:.cpp=.o)))
 CPP_DEPS := $(addprefix $(PROJECT_DIR)/build/,$(notdir $(CPP_SRCS:.cpp=.d)))
 
-PROJECT_OBJS = $(ASM_OBJS) $(C_OBJS) $(CPP_OBJS)
+RUST_SRCS := $(wildcard $(PROJECT_DIR)/*.rs)
+RUST_OBJS := $(addprefix $(PROJECT_DIR)/build/lib,$(notdir $(RUST_SRCS:.rs=.so)))
+RUST_DEPS := $(addprefix $(PROJECT_DIR)/build/,$(notdir $(RUST_SRCS:.rs=.d)))
+
+PROJECT_OBJS = $(ASM_OBJS) $(C_OBJS) $(CPP_OBJS) $(RUST_OBJS)
 
 # Core Bela sources
-CORE_CPP_SRCS = $(filter-out core/default_main.cpp core/default_libpd_render.cpp, $(wildcard core/*.cpp))
+CORE_CPP_SRCS = $(filter-out core/rust_glue.cpp core/default_main.cpp core/default_libpd_render.cpp, $(wildcard core/*.cpp))
 CORE_OBJS := $(addprefix build/core/,$(notdir $(CORE_CPP_SRCS:.cpp=.o)))
 CORE_CPP_DEPS := $(addprefix build/core/,$(notdir $(CORE_CPP_SRCS:.cpp=.d)))
 
@@ -143,6 +147,9 @@ CORE_ASM_SRCS := $(wildcard core/*.S)
 CORE_ASM_OBJS := $(addprefix build/core/,$(notdir $(CORE_ASM_SRCS:.S=.o)))
 CORE_ASM_DEPS := $(addprefix build/core/,$(notdir $(CORE_ASM_SRCS:.S=.d)))
 
+CORE_RUST_SRCS := $(wildcard core/*.rs)
+CORE_RUST_OBJS := $(addprefix build/core/,$(notdir $(CORE_RUST_SRCS:.rs=.rlib)))
+CORE_RUST_DEPS := $(addprefix build/core/,$(notdir $(CORE_RUST_SRCS:.rs=.d)))
 
 # Objects for a system-supplied default main() file, if the user
 # only wants to provide the render functions.
@@ -155,6 +162,12 @@ DEFAULT_MAIN_CPP_DEPS := ./build/core/default_main.d
 DEFAULT_PD_CPP_SRCS := ./core/default_libpd_render.cpp
 DEFAULT_PD_OBJS := ./build/core/default_libpd_render.o
 DEFAULT_PD_CPP_DEPS := ./build/core/default_libpd_render.d
+
+# Wrapper for the Rust user code, compiled in only if there are rust files in
+# the project directory
+DEFAULT_RUST_CPP_SRCS := ./core/rust_glue.cpp
+DEFAULT_RUST_OBJS := ./build/core/rust_glue.o
+DEFAULT_RUST_CPP_DEPS := ./build/core/rust_glue.d
 
 Bela: ## Builds the Bela program with all the optimizations
 Bela: $(OUTPUT_FILE)
@@ -183,6 +196,14 @@ build/core/%.o: ./core/%.cpp
 	$(AT) echo ' ...done'
 	$(AT) echo ' '
 
+# Rule for Bela core Rust files
+build/core/%.rlib: ./core/%.rs
+	$(AT) echo 'Building $(notdir $<)...'
+#	$(AT) echo 'Invoking: Rust compiler'
+	$(AT) rustc --crate-type=rlib --out-dir=build/core "$<"
+	$(AT) echo ' ...done'
+	$(AT) echo ' '
+
 # Rule for Bela core ASM files
 build/core/%.o: ./core/%.S
 	$(AT) echo 'Building $(notdir $<)...'
@@ -196,6 +217,14 @@ $(PROJECT_DIR)/build/%.o: $(PROJECT_DIR)/%.cpp
 	$(AT) echo 'Building $(notdir $<)...'
 #	$(AT) echo 'Invoking: C++ Compiler $(CXX)'
 	$(AT) $(CXX) $(SYNTAX_FLAG) $(INCLUDES) $(DEFAULT_CPPFLAGS) -Wall -c -fmessage-length=0 -U_FORTIFY_SOURCE -MMD -MP -MF"$(@:%.o=%.d)" -MT"$(@:%.o=%.d)" -o "$@" "$<" $(CPPFLAGS)
+	$(AT) echo ' ...done'
+	$(AT) echo ' '
+
+# Rule for user-supplied Rust files
+$(PROJECT_DIR)/build/%.so: $(PROJECT_DIR)/%.rs
+	$(AT) echo 'Building $(notdir $<)...'
+#	$(AT) echo 'Invoking: Rust compiler $(CXX)'
+	$(AT) rustc -Lbuild/core --crate-type=dylib --out-dir $(PROJECT_DIR)/build/ "$<"
 	$(AT) echo ' ...done'
 	$(AT) echo ' '
 
@@ -220,14 +249,16 @@ $(PROJECT_DIR)/build/%.o: $(PROJECT_DIR)/%.S
 # function, and conditionally call one of two recursive make targets depending on whether
 # we want to link in the default main file or not. The kludge is the mess of a shell script
 # line below. Surely there's a better way to do this?
-$(OUTPUT_FILE): $(CORE_ASM_OBJS) $(CORE_OBJS) $(PROJECT_OBJS) $(STATIC_LIBS) $(DEFAULT_MAIN_OBJS) $(DEFAULT_PD_OBJS)
+$(OUTPUT_FILE): $(CORE_ASM_OBJS) $(CORE_OBJS) $(CORE_RUST_OBJS) $(PROJECT_OBJS) $(STATIC_LIBS) $(DEFAULT_MAIN_OBJS) $(DEFAULT_PD_OBJS)
 	$(eval DEFAULT_MAIN_CONDITIONAL :=\
 	    $(shell bash -c '[ `nm $(PROJECT_OBJS) 2>/dev/null | grep -w T | grep -w main | wc -l` == '0' ] && echo "$(DEFAULT_MAIN_OBJS)" || : '))
 	$(AT) #If there is a .pd file AND there is no "render" symbol then link in the $(DEFAULT_PD_OBJS) 
 	$(eval DEFAULT_PD_CONDITIONAL :=\
 	    $(shell bash -c '{ ls $(PROJECT_DIR)/*.pd &>/dev/null && [ `nm $(PROJECT_OBJS) 2>/dev/null | grep -w T | grep "render.*BelaContext" | wc -l` -eq 0 ]; } && echo '$(DEFAULT_PD_OBJS)' || : ' ))
+	$(eval DEFAULT_RUST_CONDITIONAL :=\
+	    $(shell bash -c '{ ls $(PROJECT_DIR)/*.rs &>/dev/null ; } && echo '$(DEFAULT_RUST_OBJS)' || : ' ))
 	$(AT) echo 'Linking...'
-	$(AT) $(CXX) $(SYNTAX_FLAG) $(LDFLAGS) -L/usr/xenomai/lib -L/usr/arm-linux-gnueabihf/lib -L/usr/arm-linux-gnueabihf/lib/xenomai -L/usr/lib/arm-linux-gnueabihf -pthread -Wpointer-arith -o "$(PROJECT_DIR)/$(PROJECT)" $(CORE_ASM_OBJS) $(CORE_OBJS) $(DEFAULT_MAIN_CONDITIONAL) $(DEFAULT_PD_CONDITIONAL) $(ASM_OBJS) $(C_OBJS) $(CPP_OBJS) $(STATIC_LIBS) $(LIBS) $(LDLIBS)
+	$(AT) $(CXX) $(SYNTAX_FLAG) $(LDFLAGS) -L/usr/xenomai/lib -L/usr/arm-linux-gnueabihf/lib -L/usr/arm-linux-gnueabihf/lib/xenomai -L/usr/lib/arm-linux-gnueabihf -pthread -Wpointer-arith -o "$(PROJECT_DIR)/$(PROJECT)" $(CORE_ASM_OBJS) $(CORE_OBJS) $(DEFAULT_MAIN_CONDITIONAL) $(DEFAULT_PD_CONDITIONAL) $(DEFAULT_RUST_CONDITIONAL) $(ASM_OBJS) $(C_OBJS) $(CPP_OBJS) $(RUST_OBJS) $(STATIC_LIBS) $(LIBS) $(LDLIBS) -ldl
 	$(AT) echo ' ...done'
 	
 # Other Targets:
